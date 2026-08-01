@@ -1,6 +1,9 @@
-Reproducible material for **DW0118:Propagating the prior from far to near offset: A self-supervised diffusion framework for progressively recovering near-offsets of towed-streamer data - Shijun Cheng and Tariq Alkhalifah.**
+<div align="center">
 
-[Click here](https://kaust.sharepoint.com/:f:/r/sites/M365_Deepwave_Documents/Shared%20Documents/Restricted%20Area/REPORTS/DW0118?csf=1&web=1&e=mjnt4P) to access the Project Report. Authentication to the _Restricted Area_ filespace is required.
+<h3><strong>Propagating the prior from far to near offset: A self-supervised diffusion framework for progressively recovering near-offsets of towed-streamer data</strong></h2>
+
+</div>
+
 
 # Project structure
 This repository is organized as follows:
