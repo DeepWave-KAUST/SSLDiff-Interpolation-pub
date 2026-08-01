@@ -1,3 +1,16 @@
+"""
+U-Net backbone for the conditional seismic diffusion model.
+
+The network predicts a clean target seismic patch from two inputs:
+1. ``inp``: the noisy target patch x_t at the current diffusion timestep.
+2. ``shot_far``: the adjacent conditioning patch y extracted with a one-trace shift.
+
+The two patches are concatenated along the channel dimension before entering
+the encoder. Diffusion-timestep embeddings condition every residual block.
+All original variable, module, and parameter names are preserved so that
+existing checkpoints remain compatible.
+"""
+
 from abc import abstractmethod
 
 import math
@@ -22,7 +35,7 @@ class TimeEmbedding(nn.Module):
     __doc__ = r"""Computes a positional embedding of timesteps.
 
     Input:
-        x: tensor of shape (N)
+        x: tensor of shape (N)
     Output:
         tensor of shape (N, dim)
     Args:
@@ -37,99 +50,46 @@ class TimeEmbedding(nn.Module):
         self.scale = scale
 
     def forward(self, x):
+        # Keep the sinusoidal embedding on the same device as the timesteps.
         device = x.device
+
+        # Split the embedding dimension equally between sine and cosine terms.
         half_dim = self.dim // 2
+        # Construct the logarithmically spaced frequencies used by the
+        # sinusoidal diffusion-timestep embedding.
         emb = math.log(10000) / half_dim
         emb = th.exp(th.arange(half_dim, device=device) * -emb)
+
+        # Form one frequency response for every timestep in the batch.
         emb = th.outer(x * self.scale, emb)
+
+        # Concatenate sine and cosine components to obtain shape (N, dim).
         emb = th.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-class SXPositionalEmbedding(nn.Module):
-    __doc__ = r"""Computes a positional embedding of Source location.
-
-    Input:
-        x: tensor of shape (N)
-    Output:
-        tensor of shape (N, dim)
-    Args:
-        dim (int): embedding dimension
-        scale (float): linear scale to be applied to timesteps. Default: 1.0
-    """
-
-    def __init__(self, dim, scale=0.004):
-        super().__init__()
-        assert dim % 2 == 0
-        self.dim = dim
-        self.scale = scale
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / half_dim
-        emb = th.exp(th.arange(half_dim, device=device) * -emb)
-        emb = th.outer(x * self.scale, emb)
-        emb = th.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-class VelEmbedding(nn.Module):
-    __doc__ = r"""Computes a velocity embedding.
-
-    Input:
-        x: tensor of shape (B, C, Nz)
-    Output:
-        tensor of shape (B, C, Nt)
-    Args:
-        dim_depth (int): depth dim
-        dim_time (int): time dim
-    """
-
-    def __init__(self, inp_channels, out_channels, dim_depth, dim_time, dims=2, scale = 0.0002):
-        super().__init__()
-        self.inp_channels = inp_channels
-        self.dim_depth = dim_depth
-        self.dim_time = dim_time
-        self.scale = scale
-        self.vel_mlp  = nn.Sequential(
-            nn.Linear(dim_depth, dim_time),
-            nn.SiLU()
-        )
-
-        self.conv = conv_nd(dims, inp_channels, out_channels, 3, padding=1)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-
-        if h != self.dim_depth:
-            raise ValueError("velocity height should be consistent with setting")
-        if c != self.inp_channels:
-            raise ValueError("input channel should be consistent with setting")
-
-        x = self.scale * x.permute(0, 1, 3, 2).reshape(b * c * w, h)
-        x = self.vel_mlp(x)
-        x = x.view(b, c, w, self.dim_time).permute(0, 1, 3, 2)
-        emb = self.conv(x)
-
         return emb
 
 class TimestepBlock(nn.Module):
     """
-    Any module where forward() takes timestep and source location embeddings as a second argument.
+    Base class for modules whose forward method also receives a timestep embedding.
+
+    The current conditional seismic U-Net uses only the diffusion-timestep
+    embedding ``time_emb`` in these blocks.
     """
 
     @abstractmethod
     def forward(self, x, time_emb):
         """
-        Apply the module to `x` given `emb` timestep embeddings.
+        Apply the module to ``x`` conditioned on ``time_emb``.
         """
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
-    A sequential module that passes timestep and source location embeddings to the children that
-    support it as an extra input.
+    Sequential container that forwards ``time_emb`` to child TimestepBlock modules.
+
+    Standard layers receive only the feature tensor ``x``.
     """
 
     def forward(self, x, time_emb):
+        # Pass the timestep embedding only to layers that explicitly support it.
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, time_emb)
@@ -273,12 +233,21 @@ class ResBlock(TimestepBlock):
         )
 
     def _forward(self, x, time_emb):
+        # Transform the input feature map through normalization, activation,
+        # and convolution.
         h = self.in_layers(x)
+
+        # Project the timestep embedding to the channel dimension required by
+        # this residual block and match the feature dtype.
         time_emb_out = self.time_emb_layers(time_emb).type(h.dtype)
+        # Add singleton spatial dimensions so that the timestep embedding
+        # broadcasts over time and offset coordinates.
         while len(time_emb_out.shape) < len(h.shape):
             time_emb_out = time_emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            # Adaptive scale-shift normalization injects the diffusion
+            # timestep into the residual feature transformation.
             scale, shift = th.chunk(time_emb_out, 2, dim=1)
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
@@ -311,8 +280,12 @@ class AttentionBlock(nn.Module):
         return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
 
     def _forward(self, x):
+        # Flatten all spatial dimensions so attention operates over every
+        # time-offset position in the seismic feature map.
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
+        # Generate query, key, and value tensors and distribute the channel
+        # dimension over the configured attention heads.
         qkv = self.qkv(self.norm(x))
         qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
         h = self.attention(qkv)
@@ -367,9 +340,13 @@ class QKVAttention(nn.Module):
 
 class UNetModel(nn.Module):
     """
-    The full UNet model with attention and timestep embedding.
+    Conditional U-Net with self-attention and diffusion-timestep embedding.
 
-    :param in_channels: channels in the input Tensor.
+    ``in_channels`` refers to the channel count after concatenating ``inp`` and
+    ``shot_far``. In the manuscript configuration, the noisy target and the
+    conditioning patch each contain one channel, yielding a two-channel input.
+
+    :param in_channels: channels in the concatenated input tensor.
     :param model_channels: base channel count for the model.
     :param out_channels: channels in the output Tensor.
     :param num_res_blocks: number of residual blocks per downsample.
@@ -423,8 +400,12 @@ class UNetModel(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.num_heads = num_heads
         self.num_heads_upsample = num_heads_upsample
+        # Spatial dimensions must be divisible by this factor after all
+        # encoder downsampling operations.
         self.padder_size = 2 ** len(channel_mult)
 
+        # Project the scalar diffusion timestep to the conditioning dimension
+        # used by all residual blocks.
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             TimeEmbedding(model_channels, time_emb_scale),
@@ -436,8 +417,12 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
+        # Initial convolution maps the concatenated noisy-target and
+        # conditioning channels into the base feature dimension.
         self.inp = conv_nd(dims, in_channels, model_channels, 3, padding=1)
 
+        # Encoder blocks progressively reduce spatial resolution while
+        # increasing the number of feature channels.
         self.downs = nn.ModuleList([])
         encoder_channels = [model_channels]
         ch = model_channels
@@ -471,6 +456,8 @@ class UNetModel(nn.Module):
                 encoder_channels.append(ch)
                 ds *= 2
 
+        # Bottleneck blocks operate at the lowest spatial resolution and
+        # include self-attention for long-range seismic-event interactions.
         self.middle = TimestepEmbedSequential(
             ResBlock(
                 ch,
@@ -491,6 +478,8 @@ class UNetModel(nn.Module):
             ),
         )
 
+        # Decoder blocks restore spatial resolution and fuse encoder
+        # information through symmetric skip connections.
         self.ups = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
@@ -519,6 +508,8 @@ class UNetModel(nn.Module):
                     ds //= 2
                 self.ups.append(TimestepEmbedSequential(*layers))
 
+        # Final normalized projection maps decoder features to the requested
+        # diffusion-model output channels.
         self.out = nn.Sequential(
             normalization(ch),
             SiLU(),
@@ -550,119 +541,88 @@ class UNetModel(nn.Module):
 
     def forward(self, inp, shot_far, timesteps, y=None):
         """
-        Apply the model to an input batch.
+        Predict the clean target seismic patch from a noisy target and condition.
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param sparse_image: an [N x C x ...] Tensor of sparse_image.
-        :param timesteps: [N] a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
+        :param inp: an [N x C x H x W] tensor containing the noisy target
+            patch x_t at the sampled diffusion timestep.
+        :param shot_far: an [N x C x H x W] tensor containing the adjacent
+            conditioning patch y. In this project, it provides the recorded
+            offset context used to reconstruct the one-trace-shifted target.
+        :param timesteps: an [N] tensor containing the diffusion timestep of
+            each sample in the batch.
+        :param y: an [N] tensor of class labels when class conditioning is
+            enabled. It is unused in the current seismic reconstruction setup.
+        :return: an [N x out_channels x H x W] tensor containing the model
+            prediction, typically the clean target patch x_0.
         """
+        # Preserve the original target-patch size so padding can be removed
+        # from the network output.
         b, c, h, w = inp.shape
+
+        # Concatenate the noisy target patch x_t and adjacent conditioning
+        # patch shot_far along the channel dimension.
         x = th.cat([inp, shot_far], dim=1)
+
+        # Replicate-pad the time and offset dimensions when required by the
+        # sequence of encoder downsampling operations.
         x = self.check_image_size(x)
 
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
 
+        # Encode the sampled diffusion timestep for residual-block conditioning.
         time_emb = self.time_embed(timesteps)
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             time_emb = time_emb + self.label_emb(y)
 
+        # Store encoder features for the symmetric decoder skip connections.
         skips = []
+
+        # Match the precision used by the U-Net body, then apply the input
+        # projection to the concatenated seismic patches.
         x = x.type(self.inner_dtype)
         x = self.inp(x)
         skips.append(x)
 
+        # Run the encoder and retain every intermediate feature tensor needed
+        # by the decoder.
         for module in self.downs:
             x = module(x, time_emb)
             skips.append(x)
 
+        # Process the lowest-resolution representation.
         x = self.middle(x, time_emb)
 
+        # Concatenate each decoder feature map with its matching encoder
+        # feature map before applying the corresponding up block.
         for module in self.ups:
             cat_in = th.cat([x, skips.pop()], dim=1)
             x = module(cat_in, time_emb)
 
+        # Restore the input precision, predict the diffusion target, and crop
+        # away any padding introduced by check_image_size().
         x = x.type(inp.dtype)
         x = self.out(x)
         return x[:, :, :h, :w]
 
-    def get_feature_vectors(self, inp, shot_far, timesteps, y=None):
-        """
-        Apply the model and return all of the intermediate tensors.
-
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: [N] a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: a dict with the following keys:
-                 - 'down': a list of hidden state tensors from downsampling.
-                 - 'middle': the tensor of the output of the lowest-resolution
-                             block in the model.
-                 - 'up': a list of hidden state tensors from upsampling.
-        """
-        b, c, h, w = inp.shape
-        x = th.cat([inp, shot_far], dim=1)
-        x = self.check_image_size(x)
-
-        time_emb = self.time_embed(timesteps)
-
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            time_emb = time_emb + self.label_emb(y)
-
-        result = dict(down=[], middle=[], up=[])
-
-        skips = []
-        x = x.type(self.inner_dtype)
-        x = self.inp(x)
-        skips.append(x)
-
-        for module in self.downs:
-            x = module(x, time_emb)
-            skips.append(x)
-            result["down"].append(x.type(inp.dtype))
-
-        x = self.middle(x, time_emb)
-        result["middle"] = x.type(inp.dtype)
-
-        for module in self.ups:
-            cat_in = th.cat([x, skips.pop()], dim=1)
-            x = module(cat_in, time_emb)
-            result["up"].append(x.type(inp.dtype))
-
-        return result
-
     def check_image_size(self, x):
+        """
+        Pad the time and offset dimensions to sizes compatible with the U-Net.
+
+        Replicate padding is applied only to the bottom and right boundaries.
+        The forward method crops the final prediction back to the original
+        target-patch dimensions.
+        """
         _, _, h, w = x.size()
+
+        # Determine the minimum padding needed for repeated factor-of-two
+        # downsampling and upsampling.
         mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
+
+        # Replicate boundary values instead of introducing artificial zeros.
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode='replicate')
         return x
-
-
-class SuperResModel(UNetModel):
-    """
-    A UNetModel that performs super-resolution.
-
-    Expects an extra kwarg `low_res` to condition on a low-resolution image.
-    """
-
-    def __init__(self, in_channels, *args, **kwargs):
-        super().__init__(in_channels * 2, *args, **kwargs)
-
-    def forward(self, x, shot_far, timesteps, low_res=None, **kwargs):
-        _, _, new_height, new_width = x.shape
-        upsampled = F.interpolate(low_res, (new_height, new_width), mode="bilinear")
-        x = th.cat([x, upsampled], dim=1)
-        return super().forward(x, shot_far, timesteps, **kwargs)
-
-    def get_feature_vectors(self, x, shot_far, timesteps, low_res=None, **kwargs):
-        _, new_height, new_width, _ = x.shape
-        upsampled = F.interpolate(low_res, (new_height, new_width), mode="bilinear")
-        x = th.cat([x, upsampled], dim=1)
-        return super().get_feature_vectors(x, shot_far, timesteps, **kwargs)
-

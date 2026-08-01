@@ -192,10 +192,10 @@ class GaussianDiffusion:
 
         In other words, sample from q(x_t | x_0).
 
-        :param x_start: the initial data batch.
+        :param x_start: the clean target seismic patch x_0.
         :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :param noise: if specified, the split-out normal noise.
-        :return: A noisy version of x_start.
+        :param noise: optional Gaussian noise epsilon with the same shape as x_start.
+        :return: The noisy target patch x_t generated from x_start and noise.
         """
         if noise is None:
             noise = th.randn_like(x_start)
@@ -238,10 +238,11 @@ class GaussianDiffusion:
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
         the initial x, x_0.
 
-        :param model: the model, which takes a signal and a batch of timesteps
-                      as input.
-        :param x: the [N x C x ...] tensor at time t.
-        :param sparse_image: the [N x C x ...] tensor of sparse_image.
+        :param model: the conditional U-Net, which receives x_t, shot_far, and
+                      the diffusion timestep as inputs.
+        :param x: the noisy target seismic patch x_t with shape [N x C x ...].
+        :param shot_far: the [N x C x ...] conditioning patch extracted from the adjacent offset range.
+                         It provides the far-offset context used to predict the clean target patch.
         :param t: a 1-D Tensor of timesteps.
         :param clip_denoised: if True, clip the denoised signal into [-1, 1].
         :param denoised_fn: if not None, a function which applies to the
@@ -258,14 +259,19 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
+        # B is the batch size and C is the number of target-data channels.
         B, C = x.shape[:2]
         assert t.shape == (B,)
+        # shot_far is the adjacent far-offset conditioning patch y. The model
+        # predicts the clean target patch from the noisy target x and shot_far.
         model_output = model(x, shot_far, self._scale_timesteps(t), **model_kwargs)
 
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
 
+            # Split the network output into the mean-prediction channels and
+            # the channels used to parameterize the reverse-process variance.
             model_output, model_var_values = th.split(model_output, C, dim=1)
             if self.model_var_type == ModelVarType.LEARNED:
 
@@ -279,6 +285,7 @@ class GaussianDiffusion:
                 )
                 max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
                 # The model_var_values is [-1, 1] for [min_var, max_var].
+                # Map the predicted variance-control values from [-1, 1] to [0, 1].
                 frac = (model_var_values + 1) / 2  
                 model_log_variance = frac * max_log + (1 - frac) * min_log
 
@@ -373,9 +380,9 @@ class GaussianDiffusion:
         """
         Sample x_{t-1} from the model at the given timestep.
 
-        :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
-        :param sparse_image: the tensor of sparse_image.
+        :param model: the trained conditional U-Net used for reverse sampling.
+        :param x: the current noisy target patch x_t.
+        :param shot_far: the conditioning seismic patch from the adjacent offset range.
         :param t: the value of t, starting at 0 for the first diffusion step.
         :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
         :param denoised_fn: if not None, a function which applies to the
@@ -386,6 +393,7 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
+        # Evaluate the conditional reverse distribution using shot_far as y.
         out = self.p_mean_variance(
             model,
             x,
@@ -395,6 +403,7 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+        # Draw Gaussian noise for stochastic DDPM sampling.
         noise = th.randn_like(x)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -419,11 +428,11 @@ class GaussianDiffusion:
         """
         Generate samples from the model.
 
-        :param model: the model module.
-        :param sparse_image: the sparse_image.
-        :param shape: the shape of the samples, (N, C, H, W).
-        :param noise: if specified, the noise from the encoder to sample.
-                      Should be of the same shape as `shape`.
+        :param model: the trained conditional U-Net.
+        :param shot_far: the conditioning seismic patch from the adjacent offset range.
+        :param shape: output shape (N, C, Nt, W) of the seismic target patches.
+        :param noise: optional initial Gaussian sample x_T with the same shape
+                      as `shape`.
         :param clip_denoised: if True, clip x_start predictions to [-1, 1].
         :param denoised_fn: if not None, a function which applies to the
             x_start prediction before it is used to sample.
@@ -432,8 +441,11 @@ class GaussianDiffusion:
         :param device: if specified, the device to create the samples on.
                        If not specified, use a model parameter's device.
         :param progress: if True, show a tqdm progress bar.
-        :return: a non-differentiable batch of samples.
+        :return: the final reconstructed patch, selected intermediate samples,
+                 and selected clean-patch predictions.
         """
+        # final stores the last reverse-diffusion output. image_all and
+        # pred_xstart collect selected intermediate results for inspection.
         final = None
         for sample, image_all, pred_xstart in self.p_sample_loop_progressive(
             model,
@@ -472,6 +484,7 @@ class GaussianDiffusion:
         if device is None:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
+        # Initialize x_T either from user-provided noise or standard Gaussian noise.
         if noise is not None:
             image = noise
         else:
@@ -485,6 +498,7 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        # Store selected intermediate noisy samples and clean x_0 predictions.
         image_all = []
         pred_xstart = []
         for i in indices:
@@ -521,6 +535,7 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
+        # Evaluate the conditional reverse distribution using shot_far as y.
         out = self.p_mean_variance(
             model,
             x,
@@ -532,16 +547,22 @@ class GaussianDiffusion:
         )
         # Usually our model outputs epsilon, but we re-derive it
         # in case we used x_start or x_prev prediction.
+        # Recover the noise estimate epsilon from the predicted clean patch x_0.
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
+        # alpha_bar and alpha_bar_prev are the cumulative signal-retention
+        # coefficients at the current and previous DDIM timesteps.
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        # eta controls the stochasticity of DDIM; eta = 0 gives deterministic sampling.
         sigma = (
             eta
             * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
             * th.sqrt(1 - alpha_bar / alpha_bar_prev)
         )
         # Equation 12.
+        # Draw Gaussian noise for stochastic DDPM sampling.
         noise = th.randn_like(x)
+        # Compute the DDIM mean update from the clean-patch and noise estimates.
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
@@ -567,6 +588,7 @@ class GaussianDiffusion:
         Sample x_{t+1} from the model using DDIM reverse ODE.
         """
         assert eta == 0.0, "Reverse ODE only for deterministic path"
+        # Evaluate the conditional reverse distribution using shot_far as y.
         out = self.p_mean_variance(
             model,
             x,
@@ -585,6 +607,7 @@ class GaussianDiffusion:
         alpha_bar_next = _extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
 
         # Equation 12. reversed
+        # Compute the DDIM mean update from the clean-patch and noise estimates.
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_next)
             + th.sqrt(1 - alpha_bar_next) * eps
@@ -648,6 +671,7 @@ class GaussianDiffusion:
         if device is None:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
+        # Initialize x_T either from user-provided noise or standard Gaussian noise.
         if noise is not None:
             image = noise
         else:
@@ -660,6 +684,7 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        # Store selected intermediate noisy samples and clean x_0 predictions.
         image_all = []
         pred_xstart = []
         for i in indices:
@@ -681,7 +706,7 @@ class GaussianDiffusion:
             yield out, image_all, pred_xstart
             image = out["sample"]
 
-    # 计算loss，即KL散度
+    # Compute one variational-bound term using the conditional seismic model.
     def _vb_terms_bpd(
         self, model, x_start, x_t, shot_far, t, clip_denoised=True, model_kwargs=None
     ):
@@ -696,9 +721,8 @@ class GaussianDiffusion:
                  - 'pred_xstart': the x_0 predictions.
         """
 
-        '''
-         不等于0的情况下利用IDDPM文章的式(6)来计算L_(t-1)
-        '''
+        # For t > 0, evaluate the KL term between the true posterior and
+        # the model posterior; for t = 0, use the decoder negative log-likelihood.
 
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=x_start, x_t=x_t, t=t
@@ -728,8 +752,8 @@ class GaussianDiffusion:
         Compute training losses for a single timestep.
 
         :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of image gather.
-        :param sparse_image: the [N x C x ...] tensor of sparse_imageocity model.
+        :param x_start: the [N x C x ...] clean target seismic patch x_0.
+        :param shot_far: the [N x C x ...] conditioning seismic patch y used by the conditional U-Net.
         :param t: a batch of timestep indices.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
@@ -742,6 +766,7 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
 
+        # Generate the noisy target patch x_t from the clean target x_start.
         x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
@@ -762,6 +787,8 @@ class GaussianDiffusion:
 
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
 
+            # Condition the U-Net on shot_far while predicting the selected
+            # training target from the noisy target patch x_t.
             model_output = model(x_t, shot_far, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -771,6 +798,8 @@ class GaussianDiffusion:
                 B, C = x_t.shape[:2]
                 assert model_output.shape == (B, C * 2, *x_t.shape[2:])
 
+                # Split the network output into the mean-prediction channels and
+                # the channels used to parameterize the reverse-process variance.
                 model_output, model_var_values = th.split(model_output, C, dim=1)
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
@@ -791,6 +820,8 @@ class GaussianDiffusion:
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
 
+            # Select the supervised quantity according to model_mean_type. In
+            # this manuscript, START_X makes the target equal to the clean x_0 patch.
             target = {
                 ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
                     x_start=x_start, x_t=x_t, t=t
@@ -799,6 +830,7 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
+            # Average the pointwise squared error over all non-batch dimensions.
             terms["mse"] = mean_flat((target - model_output) ** 2)
 
             if "vb" in terms:
@@ -834,8 +866,8 @@ class GaussianDiffusion:
         as well as other related quantities.
 
         :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of image gather.
-        :param sparse_image: the [N x C x ...] tensor of sparse_imageocity model.
+        :param x_start: the [N x C x ...] clean target seismic patch x_0.
+        :param shot_far: the [N x C x ...] conditioning seismic patch y used by the conditional U-Net.
         :param clip_denoised: if True, clip denoised samples.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
@@ -898,6 +930,7 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
     """
     res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    # Add singleton dimensions before broadcasting to the seismic tensor shape.
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
